@@ -1,0 +1,11 @@
+pandas
+yfinance
+google-cloud-bigquery
+google-auth
+gspread
+python-dotenv
+requests
+lxml
+pandas-gbq
+pytz
+oauth2client
