@@ -1,246 +1,315 @@
+"""
+SP500 Finance ETL - Security Hardened Version
+Fetches S&P 500 companies data and syncs to Google Sheets + BigQuery
+"""
+
 import os
-import time
-import requests
-import pandas as pd
-import yfinance as yf
-import pytz
-import gspread
-import google.auth
-from io import StringIO
+import json
+import re
 from datetime import datetime, timedelta
+from time import time
+import pandas as pd
+import requests
+from dotenv import load_dotenv
+from google.oauth2 import service_account
 from google.cloud import bigquery
-from dotenv import load_dotenv # Importante
-from oauth2client.service_account import ServiceAccountCredentials
-import warnings
+import gspread
 
-warnings.filterwarnings("ignore")
-
-# --- 1. CARGA DE VARIABLES DE ENTORNO ---
+# Load environment variables
 load_dotenv()
 
-# --- 2. CONFIGURACIÓN DE DATOS (Centralizada en .env) ---
-PROJECT_ID = os.getenv("GCP_PROJECT_ID")
-DATASET_ID = os.getenv("BQ_DATASET_NAME")      # finance_data
-TABLE_ID = os.getenv("BQ_TABLE_HISTORICO")     # sp500_history
-SHEET_NAME = "pyroboadvisor" 
-TAB_NAME = "EEUU_watchlist"
+# =====================================
+# CONFIGURATION & VALIDATION
+# =====================================
 
-# --- 3. CONFIGURACIÓN TELEGRAM (Segura) ---
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") # Ojo: debe llamarse igual que en tu .env
+def validate_env_vars():
+    """Validate all required environment variables with format checking"""
+    errors = []
+    
+    # Telegram Bot Token (format: numeric:alphanumeric)
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token or not re.match(r'^\d+:[A-Za-z0-9_-]+$', token):
+        errors.append("TELEGRAM_BOT_TOKEN inválido (formato: 1234567890:ABCdef...)")
+    
+    # Telegram Chat ID (numeric, puede ser negativo)
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    if not chat_id or not chat_id.lstrip('-').isdigit():
+        errors.append("TELEGRAM_CHAT_ID debe ser numérico")
+    
+    # GCP Project ID (lowercase alphanumeric + hyphens, 6-30 chars)
+    project = os.getenv("GCP_PROJECT_ID")
+    if not project or not re.match(r'^[a-z0-9-]{6,30}$', project):
+        errors.append("GCP_PROJECT_ID inválido (6-30 caracteres, solo a-z0-9-)")
+    
+    # Google Sheets configuration
+    sheet_name = os.getenv("GOOGLE_SHEET_NAME")
+    if not sheet_name or len(sheet_name) < 1:
+        errors.append("GOOGLE_SHEET_NAME requerido")
+    
+    tab_name = os.getenv("GOOGLE_SHEET_TAB")
+    if not tab_name or len(tab_name) < 1:
+        errors.append("GOOGLE_SHEET_TAB requerido")
+    
+    # Service Account JSON path
+    sa_path = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if not sa_path or not os.path.exists(sa_path):
+        errors.append("GOOGLE_SERVICE_ACCOUNT_JSON no existe o no especificado")
+    
+    if errors:
+        print("❌ ERROR CRÍTICO: Variables de entorno inválidas:\n")
+        for err in errors:
+            print(f"   - {err}")
+        exit(1)
+    
+    return True
+
+# Validate on startup
+validate_env_vars()
+
+# Load validated environment variables
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+PROJECT_ID = os.getenv("GCP_PROJECT_ID")
+SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME")
+TAB_NAME = os.getenv("GOOGLE_SHEET_TAB")
+SA_PATH = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+CREDENTIALS_CREATED = os.getenv("CREDENTIALS_CREATED_DATE", "2026-03-26")
 
-# Validación de seguridad (Para que no corra si faltan claves)
-if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID or not PROJECT_ID:
-    print("❌ ERROR CRÍTICO: Faltan variables en el archivo .env")
-    print("   Verifica: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID y GCP_PROJECT_ID")
-    exit(1)
+# =====================================
+# TELEGRAM MESSAGING (Rate Limited)
+# =====================================
 
-# --- INICIALIZACIÓN CLIENTE BIGQUERY ---
-try:
-    client = bigquery.Client(project=PROJECT_ID)
-except Exception as e:
-    print(f"❌ Error cliente BigQuery: {e}")
-    exit(1)
+last_message_time = 0
 
-def send_telegram_msg(message):
+def send_telegram_msg(message, min_interval=2):
+    """
+    Send message to Telegram with rate limiting
+    
+    Args:
+        message: Message text (sanitized, no sensitive data)
+        min_interval: Minimum seconds between messages
+    """
+    global last_message_time
+    
+    current_time = time()
+    if current_time - last_message_time < min_interval:
+        print(f"⏳ Rate limit: esperando {min_interval}s antes de enviar")
+        return
+    
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        data = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
-        requests.post(url, data=data)
-    except Exception as e:
-        print(f"⚠️ Error Telegram: {e}")
+        data = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "parse_mode": "HTML"
+        }
+        response = requests.post(url, data=data, timeout=5)
+        response.raise_for_status()
+        last_message_time = current_time
+        print(f"✅ Telegram: {message[:50]}...")
+    except requests.exceptions.Timeout:
+        print("⚠️ Telegram timeout (5s)")
+    except requests.exceptions.RequestException as e:
+        print(f"⚠️ Telegram error: {type(e).__name__}")
 
-def get_sp500_tickers():
-    try:
-        url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
-        headers = {"User-Agent": "Mozilla/5.0"}
-        r = requests.get(url, headers=headers)
-        df = pd.read_html(StringIO(r.text))[0]
-        return [t.replace('.', '-') for t in df['Symbol'].values]
-    except Exception as e:
-        send_telegram_msg(f"⚠️ Error Wikipedia: {e}")
-        return []
+# =====================================
+# CREDENTIALS ROTATION CHECK
+# =====================================
 
-def get_personal_tickers():
-    print(f"🔐 Leyendo hoja '{TAB_NAME}'...")
+def check_credentials_age():
+    """Alert if credentials are older than 90 days"""
     try:
-        # Usamos google.auth en lugar de buscar un archivo .json
-        scopes = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-        credentials, _ = google.auth.default(scopes=scopes)
+        cred_date = datetime.strptime(CREDENTIALS_CREATED, "%Y-%m-%d")
+        age_days = (datetime.now() - cred_date).days
+        
+        if age_days > 90:
+            send_telegram_msg(
+                f"⚠️ <b>ALERTA SEGURIDAD</b>\n\n"
+                f"Credenciales tienen {age_days} días.\n"
+                f"Recomendado: Rotar cada 90 días."
+            )
+        elif age_days > 75:
+            send_telegram_msg(
+                f"🟡 Credenciales expiran pronto: {age_days}/90 días"
+            )
+    except ValueError:
+        print("⚠️ CREDENTIALS_CREATED_DATE inválido en .env")
+
+# =====================================
+# DATA FETCHING
+# =====================================
+
+def fetch_sp500_from_wikipedia():
+    """
+    Fetch S&P 500 companies list from Wikipedia
+    
+    Returns:
+        pandas.DataFrame: Company data
+    """
+    print("📡 Fetching S&P 500 from Wikipedia...")
+    
+    url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (SP500-ETL-Bot/1.0)'
+    }
+    
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        
+        tables = pd.read_html(response.text)
+        df = tables[0]
+        
+        print(f"✅ Fetched {len(df)} companies")
+        return df
+        
+    except requests.exceptions.Timeout:
+        send_telegram_msg("⚠️ Wikipedia timeout (10s)")
+        raise
+    except requests.exceptions.RequestException as e:
+        send_telegram_msg("⚠️ Error conectando a Wikipedia")
+        print(f"Error detail: {type(e).__name__}")
+        raise
+
+# =====================================
+# GOOGLE SHEETS SYNC
+# =====================================
+
+def sync_to_google_sheets(df):
+    """
+    Sync DataFrame to Google Sheets using service account
+    
+    Args:
+        df: pandas.DataFrame to upload
+    """
+    print(f"🔐 Conectando a Google Sheets (SA: {SA_PATH})...")
+    
+    try:
+        # Use service account credentials (more secure)
+        scopes = [
+            'https://spreadsheets.google.com/feeds',
+            'https://www.googleapis.com/auth/drive'
+        ]
+        
+        credentials = service_account.Credentials.from_service_account_file(
+            SA_PATH,
+            scopes=scopes
+        )
         
         gc = gspread.authorize(credentials)
+        
+        print(f"📊 Abriendo hoja '{SHEET_NAME}' / tab '{TAB_NAME}'...")
         sh = gc.open(SHEET_NAME)
         worksheet = sh.worksheet(TAB_NAME)
         
-        records = worksheet.get_all_records()
-        df = pd.DataFrame(records)
-        df.columns = [c.lower().strip() for c in df.columns]
+        # Clear and update
+        worksheet.clear()
+        worksheet.update([df.columns.values.tolist()] + df.values.tolist())
         
-        if 'ticker' in df.columns:
-            return [str(t).strip().upper().replace('.', '-') for t in df['ticker'].values if str(t).strip() != '']
-        else:
-            send_telegram_msg("⚠️ Alerta: Columna 'ticker' no encontrada en Excel.")
-            return []
+        print(f"✅ Google Sheets actualizado: {len(df)} filas")
+        send_telegram_msg(
+            f"✅ <b>Google Sheets actualizado</b>\n"
+            f"Filas: {len(df)}"
+        )
+        
+    except FileNotFoundError:
+        send_telegram_msg("❌ Service account file no encontrado")
+        raise
+    except gspread.exceptions.SpreadsheetNotFound:
+        send_telegram_msg(f"❌ Hoja '{SHEET_NAME}' no encontrada")
+        raise
     except Exception as e:
-        send_telegram_msg(f"❌ Error Excel: {e}")
-        return []
+        # Log detailed error locally, send generic message
+        print(f"❌ Google Sheets error detail: {type(e).__name__}: {str(e)}")
+        send_telegram_msg("❌ Error al actualizar Google Sheets")
+        raise
+
+# =====================================
+# BIGQUERY SYNC
+# =====================================
+
+def sync_to_bigquery(df):
+    """
+    Sync DataFrame to BigQuery
     
-
-def get_existing_tickers_in_bq():
-    query = f"SELECT DISTINCT Ticker FROM `{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}`"
+    Args:
+        df: pandas.DataFrame to upload
+    """
+    print(f"🔐 Conectando a BigQuery (project: {PROJECT_ID})...")
+    
     try:
-        df = client.query(query).to_dataframe()
-        return df['Ticker'].tolist()
-    except:
-        return []
-
-def get_last_saved_date():
-    table_ref = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
-    try:
-        sql = f"SELECT MAX(Date) as last_date FROM `{table_ref}`"
-        results = client.query(sql).result()
-        for row in results: return row.last_date
-    except: return None
-
-def process_data(data_df):
-    if data_df.empty: return pd.DataFrame()
-    try:
-        if isinstance(data_df.columns, pd.MultiIndex):
-            stack = data_df.stack(level=0).reset_index()
-            stack.rename(columns={'level_1': 'Ticker'}, inplace=True)
-        else:
-            stack = data_df.reset_index()
-            stack['Ticker'] = data_df.columns.name if data_df.columns.name else 'UNKNOWN'
-
-        cols_map = {'Date': 'Date', 'Close': 'Price', 'Volume': 'Volume'}
-        if 'Adj Close' in stack.columns: cols_map['Adj Close'] = 'Price'
-        stack = stack.rename(columns=cols_map)
+        credentials = service_account.Credentials.from_service_account_file(
+            SA_PATH
+        )
         
-        if 'Price' not in stack.columns: stack['Price'] = stack.get('Close', 0.0)
+        client = bigquery.Client(
+            credentials=credentials,
+            project=PROJECT_ID
+        )
         
-        final_df = stack[['Date', 'Ticker', 'Price', 'Volume']].dropna().copy()
-        final_df['Date'] = final_df['Date'].dt.date
-        final_df['Ticker'] = final_df['Ticker'].astype(str)
-        final_df['Price'] = final_df['Price'].astype(float)
-        final_df['Volume'] = final_df['Volume'].astype(int)
-        return final_df
-    except:
-        return pd.DataFrame()
+        table_id = f"{PROJECT_ID}.finance_data.sp500_companies"
+        
+        job_config = bigquery.LoadJobConfig(
+            write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE
+        )
+        
+        job = client.load_table_from_dataframe(
+            df, table_id, job_config=job_config
+        )
+        job.result()
+        
+        print(f"✅ BigQuery actualizado: {len(df)} filas")
+        send_telegram_msg(
+            f"✅ <b>BigQuery actualizado</b>\n"
+            f"Tabla: sp500_companies\n"
+            f"Filas: {len(df)}"
+        )
+        
+    except Exception as e:
+        print(f"❌ BigQuery error detail: {type(e).__name__}: {str(e)}")
+        send_telegram_msg("❌ Error al actualizar BigQuery")
+        raise
 
-def download_batch(tickers, start_date):
-    if not tickers: return pd.DataFrame()
-    print(f"   ⬇️ Descargando {len(tickers)} activos desde {start_date}...")
-    try:
-        d = yf.download(tickers, start=start_date, group_by='ticker', auto_adjust=True, threads=False, progress=False)
-        return process_data(d)
-    except:
-        return pd.DataFrame()
+# =====================================
+# MAIN EXECUTION
+# =====================================
 
 def main():
-    start_time = time.time()
+    """Main ETL pipeline"""
+    print("\n" + "="*50)
+    print("🚀 SP500 Finance ETL - Starting")
+    print("="*50 + "\n")
     
-    print(f"🚀 Iniciando Pipeline...")
-    tz = pytz.timezone('America/New_York')
-    today = datetime.now(tz).date()
+    # Check credentials age
+    check_credentials_age()
     
-    # --- LÓGICA DE FIN DE SEMANA ---
-    if today.weekday() > 4:
-        print("🛑 Fin de semana detectado.")
-        
-        # Calculamos tiempo (será casi 0, pero confirma ejecución)
-        end_time = time.time()
-        duration_sec = end_time - start_time
-        
-        msg_weekend = (
-             f"✅ *Monitor Activo (Fin de Semana)*\n"
-             f"📅 Fecha: {today}\n"
-             f"⏱️ Duración: {duration_sec:.2f}s\n"
-             f"📂 Tabla: \n"
-             f"😴 Estado: Mercado cerrado. Sin cambios en BD."
-        )
-        send_telegram_msg(msg_weekend)
-        return # <--- AQUÍ TERMINA SI ES SÁBADO/DOMINGO
-
-    # --- LÓGICA DE LUNES A VIERNES ---
-    sp500 = get_sp500_tickers()
-    personal = get_personal_tickers()
-    all_targets = list(set(sp500 + personal))
-    
-    existing_in_bq = get_existing_tickers_in_bq()
-    new_tickers = [t for t in all_targets if t not in existing_in_bq]
-    old_tickers = [t for t in all_targets if t in existing_in_bq]
-
-    final_data = pd.DataFrame()
-    dfs_to_concat = []
-
-    if new_tickers:
-        df_new = download_batch(new_tickers, start_date="2020-01-01")
-        if not df_new.empty: dfs_to_concat.append(df_new)
-
-    if old_tickers:
-        last_date = get_last_saved_date()
-        if last_date:
-            start_inc = last_date + timedelta(days=1)
-            if start_inc <= today:
-                df_old = download_batch(old_tickers, start_date=start_inc)
-                if not df_old.empty: dfs_to_concat.append(df_old)
-        else:
-            df_old = download_batch(old_tickers, start_date="2020-01-01")
-            if not df_old.empty: dfs_to_concat.append(df_old)
-
-    if dfs_to_concat:
-        final_data = pd.concat(dfs_to_concat)
-    
-    # Si es entre semana pero Yahoo falló o no hubo datos
-    if final_data.empty:
-        end_time = time.time()
-        duration_sec = end_time - start_time
-        minutes = int(duration_sec // 60)
-        seconds = int(duration_sec % 60)
-        
-        msg_empty = (
-            f"⚠️ *Reporte Sin Datos*\n"
-            f"📅 Fecha: {today}\n"
-            f"⏱️ Duración: {minutes}m {seconds}s\n"
-            f"El robot corrió pero no encontró precios nuevos hoy."
-        )
-        send_telegram_msg(msg_empty)
-        return
-
-    print(f"📦 Guardando {len(final_data):,} registros...")
-    table_ref = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
-    job_config = bigquery.LoadJobConfig(
-        schema=[
-            bigquery.SchemaField("Date", "DATE"),
-            bigquery.SchemaField("Ticker", "STRING"),
-            bigquery.SchemaField("Price", "FLOAT"),
-            bigquery.SchemaField("Volume", "INTEGER"),
-        ],
-        write_disposition="WRITE_APPEND",
-    )
-
     try:
-        client.load_table_from_dataframe(final_data, table_ref, job_config=job_config).result()
+        # 1. Fetch data
+        df = fetch_sp500_from_wikipedia()
         
-        # ⏱️ REPORTE DE ÉXITO (ENTRE SEMANA)
-        end_time = time.time()
-        duration_sec = end_time - start_time
-        minutes = int(duration_sec // 60)
-        seconds = int(duration_sec % 60)
-
-        msg_success = (
-            f"✅ *Carga Exitosa*\n"
-            f"📅 Fecha: {today}\n"
-            f"⏱️ Duración: {minutes}m {seconds}s\n"
-            f"📂 Tabla: \n"
-            f"📊 Registros: {len(final_data):,}\n"
-            f"🆕 Nuevos: {len(new_tickers)}"
+        # 2. Sync to Google Sheets
+        sync_to_google_sheets(df)
+        
+        # 3. Sync to BigQuery
+        sync_to_bigquery(df)
+        
+        print("\n" + "="*50)
+        print("✅ ETL COMPLETADO EXITOSAMENTE")
+        print("="*50 + "\n")
+        
+        send_telegram_msg(
+            "✅ <b>SP500 ETL Completado</b>\n\n"
+            f"Empresas procesadas: {len(df)}\n"
+            f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
-        send_telegram_msg(msg_success)
-        print("✨ ¡Éxito Total!")
+        
     except Exception as e:
-        send_telegram_msg(f"❌ Error BigQuery: {str(e)}")
-        print(f"❌ Error: {e}")
+        print(f"\n❌ ETL FAILED: {type(e).__name__}")
+        send_telegram_msg(
+            "❌ <b>SP500 ETL FAILED</b>\n\n"
+            "Revisa logs para detalles"
+        )
+        raise
 
 if __name__ == "__main__":
     main()
